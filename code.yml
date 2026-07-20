@@ -1,0 +1,61 @@
+name: WHIN Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  schema-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm schema:verify          # FAIL if generated code stale
+      - run: pnpm schema:generate
+      - uses: bufbuild/buf-action@v1
+        with:
+          input: packages/schema-registry/schemas
+          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main"
+
+  test:
+    needs: schema-gate
+    runs-on: ubuntu-latest
+    services:
+      redis: { image: redis:7-alpine, ports: ["6379:6379"] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test                   # All packages + agents
+      - run: pnpm --filter @whin/testkit build
+
+  deploy-staging:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to ACK Staging
+        run: |
+          cd infra/staging
+          terraform init
+          terraform apply -auto-approve
+      - name: Run Contract Tests Against Staging
+        run: pnpm --filter @whin/contract-tests test:staging
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to ACK Production (Canary)
+        run: |
+          cd infra/production
+          terraform init
+          terraform apply -auto-approve -var="canary_percentage=10"
+      - name: Validate Canary Metrics (15 min)
+        run: bash scripts/validate-canary.sh
+      - name: Promote to Full Production
+        run: |
+          terraform apply -auto-approve -var="canary_percentage=100"
